@@ -104,7 +104,7 @@ Planned: `services/agent_service/` (P4), `services/api/` & `ui/` (P6),
 ## 6. Installation & quick start
 
 ```bash
-git clone <your-repo> aml-guard && cd aml-guard
+git clone https://github.com/dhirajpatra/AML-Guard-a-Real-Time-Money-Laundering-Detection aml-guard && cd aml-guard
 make init                 # creates .env from .env.example (edit passwords if you like)
 make up                   # core: Neo4j, Redpanda, Redis, Postgres, simulator
 make ps                   # wait until everything is healthy / init jobs exited 0
