@@ -1,0 +1,5 @@
+pydantic>=2.7
+pydantic-settings>=2.3
+pytest>=8
+redis>=5
+fakeredis>=2.26

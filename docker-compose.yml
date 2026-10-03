@@ -1,0 +1,209 @@
+name: aml-guard
+
+# Profiles:  (default) core stack | llm = Ollama | tools = Redpanda Console
+#   docker compose up -d                       -> core
+#   docker compose --profile llm up -d         -> core + Ollama
+#   docker compose --profile llm --profile tools up -d
+
+services:
+  # ------------------------------ Graph ------------------------------
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: aml-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-aml_password_123}
+      NEO4J_PLUGINS: '["apoc","graph-data-science"]'
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1g
+      NEO4J_server_memory_pagecache_size: 512m
+      NEO4J_dbms_security_procedures_unrestricted: "gds.*,apoc.*"
+      NEO4J_dbms_security_procedures_allowlist: "gds.*,apoc.*"
+    ports:
+      - "7474:7474"   # Browser
+      - "7687:7687"   # Bolt
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u ${NEO4J_USER:-neo4j} -p ${NEO4J_PASSWORD:-aml_password_123} 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  neo4j-init:
+    image: neo4j:5.26-community
+    container_name: aml-neo4j-init
+    restart: "no"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    volumes:
+      - ./graph:/graph:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - cypher-shell -a bolt://neo4j:7687 -u ${NEO4J_USER:-neo4j} -p ${NEO4J_PASSWORD:-aml_password_123} -f /graph/01_schema.cypher
+
+  # ----------------------------- Streaming ---------------------------
+  redpanda:
+    image: redpandadata/redpanda:v24.3.7
+    container_name: aml-redpanda
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=768M
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"  # Kafka API for host tools
+      - "9644:9644"    # Admin API / metrics
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  redpanda-init:
+    image: redpandadata/redpanda:v24.3.7
+    container_name: aml-redpanda-init
+    restart: "no"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        for t in transactions.raw transactions.truth transactions.decisions transactions.dlq alerts; do
+          rpk -X brokers=redpanda:9092 topic create $$t -p 3 -r 1 || true
+        done
+
+  redpanda-console:
+    image: redpandadata/console:v2.8.2
+    container_name: aml-redpanda-console
+    profiles: ["tools"]
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # --------------------------- Cache + case store --------------------
+  redis:
+    image: redis:7.4-alpine
+    container_name: aml-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: aml-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aml}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aml_password_123}
+      POSTGRES_DB: ${POSTGRES_DB:-aml}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./db/postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aml} -d ${POSTGRES_DB:-aml}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------- LLM -------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: aml-ollama
+    profiles: ["llm"]
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # GPU (NVIDIA): uncomment
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 10s
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: aml-ollama-pull
+    profiles: ["llm"]
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - ollama pull ${OLLAMA_PULL_MODEL:-llama3.1:8b}
+
+  # ----------------------------- App services ------------------------
+  simulator:
+    build:
+      context: .
+      dockerfile: services/simulator/Dockerfile
+    container_name: aml-simulator
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      neo4j-init:
+        condition: service_completed_successfully
+
+  stream-processor:
+    build:
+      context: .
+      dockerfile: services/stream_processor/Dockerfile
+    container_name: aml-stream-processor
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      neo4j-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  redpanda_data:
+  pg_data:
+  ollama_data:

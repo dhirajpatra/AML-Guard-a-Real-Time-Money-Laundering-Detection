@@ -1,0 +1,4 @@
+confluent-kafka==2.6.1
+neo4j==5.26.0
+redis==5.2.1
+psycopg[binary]==3.2.3
