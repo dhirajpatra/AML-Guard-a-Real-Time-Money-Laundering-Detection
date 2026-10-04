@@ -2,6 +2,7 @@ from aml_common.config import Settings
 
 
 class AnalyticsSettings(Settings):
+    metrics_port: int = 8003
     net_engine: str = "auto"             # gds | networkx | auto (try GDS, fall back to networkx)
     net_interval_s: float = 60.0
     net_window_s: float = 1800.0         # recent-flow horizon (graph/event time)

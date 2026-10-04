@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     postgres_dsn: str = "postgresql://aml:aml_password_123@postgres:5432/aml"
 
+    # Observability (Phase 5)
+    otel_enabled: bool = False                       # tracing is opt-in; Prometheus metrics are always on
+    otel_exporter_otlp_endpoint: str = "http://otel-collector:4317"
+    otel_trace_sample_ratio: float = 1.0             # head sampling in the SDK; tail sampling is in the collector
+    service_name: str = "aml-guard"
+    langfuse_host: str = "http://langfuse:3000"
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+
     # LLM - provider-agnostic (used from Phase 4)
     llm_provider: str = "ollama"          # ollama | openai | anthropic | openai_compatible
     llm_model: str = "llama3.1:8b"

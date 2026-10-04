@@ -2,6 +2,7 @@ from aml_common.config import Settings
 
 
 class SimSettings(Settings):
+    metrics_port: int = 8002
     sim_tps: float = 10.0               # normal transactions per second
     sim_customers: int = 2000
     sim_scenarios_per_min: float = 6.0  # laundering scenarios started per minute

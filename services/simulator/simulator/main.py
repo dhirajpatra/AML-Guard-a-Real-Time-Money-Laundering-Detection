@@ -12,8 +12,13 @@ from datetime import datetime, timezone
 from confluent_kafka import Producer
 from neo4j import GraphDatabase
 
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind
+
 from aml_common.logging_setup import setup_logging
+from aml_common.metrics import SimulatorMetrics
 from aml_common.models import GroundTruth, Transaction
+from aml_common.telemetry import inject_headers, setup_tracing, start_metrics_server
 
 from .graph_seed import seed_graph, wait_for_neo4j
 from .population import Population, build_population
@@ -24,8 +29,10 @@ log = logging.getLogger("simulator")
 
 
 class Emitter:
-    def __init__(self, s: SimSettings, pop: Population, rng: random.Random) -> None:
+    def __init__(self, s: SimSettings, pop: Population, rng: random.Random, metrics: SimulatorMetrics | None = None) -> None:
         self.s, self.pop, self.rng = s, pop, rng
+        self.metrics = metrics
+        self.tracer = trace.get_tracer("aml.simulator")
         self.producer = Producer({
             "bootstrap.servers": s.kafka_bootstrap,
             "client.id": "aml-simulator",
@@ -35,10 +42,10 @@ class Emitter:
         self.total = 0
         self.laundering = 0
 
-    def _send(self, topic: str, key: str, value: str) -> None:
+    def _send(self, topic: str, key: str, value: str, headers=None) -> None:
         while True:
             try:
-                self.producer.produce(topic, key=key.encode(), value=value.encode())
+                self.producer.produce(topic, key=key.encode(), value=value.encode(), headers=headers or None)
                 return
             except BufferError:
                 self.producer.poll(0.1)
@@ -63,8 +70,13 @@ class Emitter:
             typology=scenario.typology if scenario else None,
             scenario_id=scenario.scenario_id if scenario else None,
         )
-        self._send(self.s.topic_raw, txn.src_account, txn.model_dump_json())
+        with self.tracer.start_as_current_span("simulator.emit", kind=SpanKind.PRODUCER) as span:
+            span.set_attribute("aml.txn_id", txn.txn_id)
+            # W3C trace context rides in Kafka headers so the processor's span joins this trace
+            self._send(self.s.topic_raw, txn.src_account, txn.model_dump_json(), headers=inject_headers())
         self._send(self.s.topic_truth, txn.txn_id, truth.model_dump_json())
+        if self.metrics:
+            self.metrics.txns.labels("laundering" if scenario else "normal").inc()
         self.producer.poll(0)
         self.total += 1
         self.laundering += scenario is not None
@@ -78,7 +90,10 @@ class Emitter:
 
 def run() -> None:
     s = SimSettings()
-    setup_logging(s.log_level)
+    setup_logging(s.log_level, "simulator")
+    setup_tracing("simulator", s.otel_enabled, s.otel_exporter_otlp_endpoint, s.otel_trace_sample_ratio)
+    start_metrics_server(s.metrics_port)
+    metrics = SimulatorMetrics()
     rng = random.Random(s.sim_seed)
     pop = build_population(rng, s.sim_customers, s.high_risk_list)
     log.info("population: %s customers, %s accounts", len(pop.customers), len(pop.accounts))
@@ -91,7 +106,7 @@ def run() -> None:
         finally:
             driver.close()
 
-    em = Emitter(s, pop, rng)
+    em = Emitter(s, pop, rng, metrics)
     stop = {"flag": False}
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.__setitem__("flag", True))
@@ -108,6 +123,7 @@ def run() -> None:
         now = time.monotonic()
         if rng.random() < scen_per_sec * (now - last_tick):
             sc = make_scenario(rng, pop)
+            metrics.scenarios.labels(sc.typology).inc()
             for p in sc.txns:
                 seq += 1
                 heapq.heappush(heap, (now + p.delay_s, seq, p, sc))

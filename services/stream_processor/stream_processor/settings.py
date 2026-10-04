@@ -2,6 +2,7 @@ from aml_common.config import Settings
 
 
 class ProcSettings(Settings):
+    metrics_port: int = 8001
     proc_group: str = "stream-processor"
     proc_batch: int = 50                 # max decisions per Postgres flush
     proc_flush_interval_s: float = 0.25

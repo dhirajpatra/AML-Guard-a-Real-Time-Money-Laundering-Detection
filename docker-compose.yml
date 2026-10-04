@@ -1,9 +1,14 @@
 name: aml-guard
 
-# Profiles:  (default) core stack | llm = Ollama | tools = Redpanda Console
+# Profiles:  (default) core stack | llm = Ollama | tools = Redpanda Console | obs = observability | cadvisor
 #   docker compose up -d                       -> core
 #   docker compose --profile llm up -d         -> core + Ollama
 #   docker compose --profile llm --profile tools up -d
+
+x-obs-env: &obs-env
+  OTEL_ENABLED: ${OTEL_ENABLED:-false}      # `make up-obs` turns tracing on; Prometheus metrics are always on
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_TRACE_SAMPLE_RATIO: ${OTEL_TRACE_SAMPLE_RATIO:-1.0}
 
 services:
   # ------------------------------ Graph ------------------------------
@@ -177,6 +182,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      <<: *obs-env
+      SERVICE_NAME: simulator
+    expose:
+      - "8002"   # Prometheus /metrics
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
@@ -191,6 +201,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      <<: *obs-env
+      SERVICE_NAME: stream-processor
+    expose:
+      - "8001"   # Prometheus /metrics
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
@@ -209,6 +224,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      <<: *obs-env
+      SERVICE_NAME: graph-analytics
+    expose:
+      - "8003"   # Prometheus /metrics
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
@@ -217,9 +237,187 @@ services:
       redis:
         condition: service_healthy
 
+  # ============================ Observability (profile: obs) ============================
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.131.0
+    container_name: aml-otel-collector
+    profiles: ["obs"]
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel/collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC (apps; also usable from the host)
+      - "4318:4318"   # OTLP HTTP
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:2.8.2
+    container_name: aml-tempo
+    profiles: ["obs"]
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    ports:
+      - "3200:3200"
+
+  loki:
+    image: grafana/loki:3.5.3
+    container_name: aml-loki
+    profiles: ["obs"]
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+
+  alloy:
+    image: grafana/alloy:v1.10.0
+    container_name: aml-alloy
+    profiles: ["obs"]
+    restart: unless-stopped
+    user: root   # needs read access to the Docker socket to tail container logs
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "--storage.path=/var/lib/alloy/data",
+              "/etc/alloy/config.alloy"]
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    ports:
+      - "12345:12345"   # Alloy UI
+    depends_on:
+      - loki
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: aml-prometheus
+    profiles: ["obs"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=3d
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "9090:9090"
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.67.0
+    container_name: aml-redis-exporter
+    profiles: ["obs"]
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: aml-postgres-exporter
+    profiles: ["obs"]
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-aml}:${POSTGRES_PASSWORD:-aml_password_123}@postgres:5432/${POSTGRES_DB:-aml}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: aml-grafana
+    profiles: ["obs"]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/aml-overview.json
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+  langfuse-db:
+    image: postgres:16-alpine
+    container_name: aml-langfuse-db
+    profiles: ["obs"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Langfuse v2 (single container + Postgres). Used by the Phase 4 agents for LLM / LangGraph traces.
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: aml-langfuse
+    profiles: ["obs"]
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3001
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-aml-guard-dev-secret-change-me}
+      SALT: ${LANGFUSE_SALT:-aml-guard-dev-salt-change-me}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_INIT_ORG_ID: aml-guard
+      LANGFUSE_INIT_ORG_NAME: AML-Guard
+      LANGFUSE_INIT_PROJECT_ID: aml-guard
+      LANGFUSE_INIT_PROJECT_NAME: AML-Guard
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-aml-guard}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-aml-guard}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_ADMIN_EMAIL:-admin@aml-guard.local}
+      LANGFUSE_INIT_USER_NAME: admin
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_ADMIN_PASSWORD:-aml-guard-admin}
+    ports:
+      - "3001:3000"
+
+  # Container CPU / memory (Linux hosts only): docker compose --profile obs --profile cadvisor up -d
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.52.1
+    container_name: aml-cadvisor
+    profiles: ["cadvisor"]
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+
 volumes:
   neo4j_data:
   neo4j_logs:
   redpanda_data:
   pg_data:
   ollama_data:
+  tempo_data:
+  loki_data:
+  alloy_data:
+  prom_data:
+  grafana_data:
+  langfuse_db:

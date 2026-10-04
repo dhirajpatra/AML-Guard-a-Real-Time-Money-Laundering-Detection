@@ -4,7 +4,7 @@ A containerised, observable, multi-agent system that scores every transaction in
 **Neo4j knowledge graph** and an **AML ontology**, and escalates suspicious activity to a **LangGraph**
 team of agents that investigates and explains it. The LLM is **pluggable** (Ollama by default).
 
-> **Status:** Phase 3 of 6 complete (hot path + cold-path graph analytics feeding network risk back into it).
+> **Status:** Phases 1, 2, 3 and 5 complete (hot path, cold-path analytics, full observability stack). Phase 4 (agents) is next.
 > See [Roadmap](#roadmap). This is a reference implementation on **synthetic data** — not a
 > production-certified AML system.
 
@@ -73,7 +73,7 @@ aml-guard/
 ├── graph/
 │   └── 01_schema.cypher        # constraints, indexes, ontology, typologies (idempotent)
 ├── db/postgres/init.sql        # decisions, alerts, audit_log
-├── libs/aml_common/            # shared settings, event models, JSON logging
+├── libs/aml_common/            # shared settings, event models, JSON logging, metrics.py, telemetry.py, llm_tracing.py
 ├── services/
 │   ├── simulator/              # Phase 1: synthetic transactions + laundering scenarios
 │   │   └── simulator/{population,scenarios,graph_seed,main,settings}.py
@@ -94,8 +94,14 @@ aml-guard/
 │           ├── netscore.py     # pure: clusters + SCC + PageRank -> per-account flags, cluster alerts
 │           ├── store.py        # Redis flags, Neo4j properties + :Cluster nodes, alert dedupe, pruning
 │           └── settings.py
-├── tests/{simulator,stream_processor,graph_analytics}/   # unit tests + "digital twin" end-to-end tests
+├── tests/{simulator,stream_processor,graph_analytics,observability}/   # unit tests, "digital twin" end-to-end tests, config validation
 ├── requirements-dev.txt
+├── observability/              # Phase 5: configs for the whole stack (profile `obs`)
+│   ├── otel/collector.yaml     # OTLP in -> tail sampling -> Tempo
+│   ├── tempo/ loki/ alloy/     # traces, logs, log shipper (tails container stdout)
+│   ├── prometheus/             # scrape config + alert rules
+│   └── grafana/                # datasources, dashboard provisioning, build_dashboards.py -> dashboards/*.json
+├── scripts/langfuse_smoke.py   # sends a test trace to Langfuse (stdlib only)
 └── docs/
 ```
 Planned: `services/agent_service/` (P4), `services/api/` & `ui/` (P6),
@@ -111,9 +117,9 @@ Planned: `services/agent_service/` (P4), `services/api/` & `ui/` (P6),
 ## 6. Installation & quick start
 
 ```bash
-git clone https://github.com/dhirajpatra/AML-Guard-a-Real-Time-Money-Laundering-Detection aml-guard && cd aml-guard
+git clone <your-repo> aml-guard && cd aml-guard
 make init                 # creates .env from .env.example (edit passwords if you like)
-make up                   # core: Neo4j, Redpanda, Redis, Postgres, simulator
+make up                   # core: Neo4j, Redpanda, Redis, Postgres, simulator, processor, analytics
 make ps                   # wait until everything is healthy / init jobs exited 0
 ```
 First start takes a few minutes (image pulls; Neo4j downloads the APOC + GDS plugins, so it needs internet).
@@ -122,7 +128,11 @@ With a local LLM (needed from Phase 4):
 ```bash
 make up-llm               # adds Ollama and pulls $OLLAMA_PULL_MODEL (llama3.1:8b, ~5 GB)
 ```
-Optional Kafka UI: `make up-all` → http://localhost:8080
+With observability (Grafana, Prometheus, Tempo, Loki, Langfuse; tracing switched on):
+```bash
+make up-obs && make urls
+```
+Optional Kafka UI + Ollama + observability together: `make up-all`.
 
 Without `make`: `cp .env.example .env && docker compose up -d --build`
 (add `--profile llm` / `--profile tools` as needed).
@@ -242,7 +252,64 @@ make reset && NET_FEATURES_ENABLED=true  SIM_MAX_TXNS=8000 make up && sleep 150 
 ```
 Compare detection, the `Early` line, and FPR. (`.env` values are overridden by the shell variables above.)
 
-## 10. Configuration (`.env`)
+## 10. Observability (Phase 5)
+
+`make up-obs` adds ten containers (profile `obs`, roughly 2–3 GB RAM) and turns tracing on:
+
+| Signal | Producer | Pipeline | Look at it in |
+|---|---|---|---|
+| **Metrics** | every service exposes `/metrics` (`prometheus_client`, always on) | Prometheus scrapes (15 s) | Grafana dashboards, alert rules |
+| **Traces** | OpenTelemetry SDK (opt-in) | OTLP → **Collector** (tail sampling) → **Tempo** | Grafana → Explore → Tempo |
+| **Logs** | JSON on stdout with `service`, `level`, `trace_id` | **Alloy** tails Docker → **Loki** | Grafana → Explore → Loki |
+| **LLM traces** | `langfuse_handler()` (Phase 4 agents) | Langfuse v2 + its own Postgres | http://localhost:3001 |
+
+`make urls` lists everything: Grafana http://localhost:3000 (admin / admin), Prometheus :9090, Langfuse :3001
+(admin@aml-guard.local / aml-guard-admin), Alloy UI :12345.
+
+**Traces.** One transaction is one trace across processes: `simulator.emit` → *(W3C `traceparent` in the Kafka
+headers)* → `process_txn` → `hotpath.redis_features`, `hotpath.graph_flow_store`, `hotpath.graph_profiles`,
+`hotpath.score`. The processor span carries `aml.verdict`, `aml.risk_score`, `aml.typology`, `aml.indicators`,
+`aml.amount`. The collector **tail-samples** whole traces: keep every `REVIEW`/`BLOCK`, every error, every trace
+slower than 250 ms, plus 10% of the rest. Try these TraceQL queries in Tempo:
+```
+{ span.aml.verdict = "BLOCK" }
+{ name = "hotpath.graph_flow_store" && duration > 50ms }
+{ span.aml.typology = "ROUND_TRIP" }
+```
+
+**Logs ↔ traces.** Every log line written inside a span has its `trace_id`; in Loki the id is a clickable link to
+the trace, and from a trace Tempo jumps to that trace's logs. LogQL examples:
+```
+{service="stream-processor"} | json | level=~"WARNING|ERROR"
+{service="graph-analytics"} | json | msg="analytics cycle"
+```
+
+**Dashboards** (folder *AML-Guard*, generated by `observability/grafana/build_dashboards.py`):
+- **Overview**: transactions/s, flagged share, hot-path p99, e2e p95, consumer lag, verdicts and alerts by
+  typology, latency by stage, indicators firing, Postgres flush, DLQ, recent BLOCK traces, live logs.
+- **Cold path**: analytics cycle time by stage, flags, graph size, engine / outcome, network alerts, pruning.
+- **Infrastructure**: scrape targets, Redis, Postgres, optional container CPU/memory (`--profile cadvisor`, Linux).
+
+**Alert rules** (Prometheus, visible at :9090/alerts): hot-path p99 > 200 ms, consumer lag > 1000, any DLQ message,
+processor down, no transactions for 10 min, flagged share > 20%, Postgres write errors, analytics stale > 5 min,
+GDS fallback. There is no Alertmanager yet: add one to route notifications.
+
+**Langfuse.** Started with a pre-created org, project and API keys (`.env`), so no clicking is needed:
+`make langfuse-smoke` sends a test trace; open :3001 → project *AML-Guard* → Traces. The Phase 4 agent service
+will pass `langfuse_handler(settings)` as a LangChain callback so every LangGraph run (agents, tool calls, tokens,
+latency) appears there, independent of which LLM backs it. Use the `langfuse<3` SDK with this v2 server.
+
+**Overhead and tuning.** Metrics are cheap and always on. Tracing adds a few microseconds per span; at high
+throughput lower `OTEL_TRACE_SAMPLE_RATIO` (e.g. `0.1`) or raise the collector's baseline sampling.
+Neo4j Community does not expose Prometheus metrics (an Enterprise feature), so graph health is observed through
+the hot-path stage latencies (`graph_flow_store`, `graph_profiles`) and the analytics cycle timings instead.
+
+**Tests.** `tests/observability` checks that every dashboard and alert PromQL expression parses, that every
+`aml_*` metric they use is really defined in `aml_common.metrics`, that dashboards match the generator, that
+Prometheus targets match Compose services and ports, that trace context survives the Kafka headers, and that logs
+carry trace ids.
+
+## 11. Configuration (`.env`)
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -269,10 +336,14 @@ Compare detection, the `Early` line, and FPR. (`.env` values are overridden by t
 | `EDGE_RETENTION_S` | `3600` | `TRANSFERRED_TO` edges older than this are pruned |
 | `NET_FEATURES_ENABLED` | `true` | Hot path consumes the cold-path flags (turn off for A/B runs) |
 | `NET_MAX_AGE_S` | `240` | Hot path ignores flags older than this (event time) |
+| `OTEL_ENABLED` | `false` (`make up-obs` sets `true`) | Turns OpenTelemetry tracing on; metrics are always exposed |
+| `OTEL_TRACE_SAMPLE_RATIO` | `1.0` | SDK head sampling (the collector tail-samples on top) |
+| `GRAFANA_ADMIN_PASSWORD` | `admin` | Grafana login |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | `pk-lf-aml-guard` / `sk-lf-aml-guard` | Pre-created Langfuse project keys |
 
 Run a finite, reproducible burst: `SIM_MAX_TXNS=5000 SIM_SEED=7 docker compose up -d --build simulator`.
 
-## 11. Everyday commands
+## 12. Everyday commands
 
 | Command | Does |
 |---|---|
@@ -283,11 +354,13 @@ Run a finite, reproducible burst: `SIM_MAX_TXNS=5000 SIM_SEED=7 docker compose u
 | `make sim-stop` / `make sim-start` | Pause / resume traffic |
 | `make decisions` / `make alerts` | Peek at hot-path verdicts / alerts |
 | `make analytics` / `make analytics-once` | Tail cold-path logs / run one cycle now and print its summary |
+| `make up-obs` / `make urls` | Start the observability stack with tracing on / list the UIs |
+| `make dashboards` / `make langfuse-smoke` | Regenerate Grafana dashboards / send a test trace to Langfuse |
 | `make net-alerts` | Peek at cluster-level alerts (`alerts.network`) |
 | `make eval` | Precision, recall, early detection and latency report vs ground truth |
 | `make graph-shell` | cypher-shell into Neo4j |
 
-## 12. Switching the LLM (Phase 4 design, config already in place)
+## 13. Switching the LLM (Phase 4 design, config already in place)
 
 ```bash
 # Local (default)
@@ -299,7 +372,7 @@ LLM_PROVIDER=openai_compatible  LLM_BASE_URL=http://host:8000/v1  LLM_MODEL=...
 ```
 Then `docker compose up -d agent-service`. Agents never import a provider SDK directly.
 
-## 13. Roadmap
+## 14. Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -307,14 +380,23 @@ Then `docker compose up -d agent-service`. Agents never import a provider SDK di
 | 2 | Hot path: stream processor, rules, Redis features, graph write + flow tracing, evaluator | ✅ done |
 | 3 | Cold path: GDS/networkx analytics (clusters, SCC loops, PageRank), network flags → hot path, cluster alerts, edge pruning | ✅ done |
 | 4 | LangGraph multi-agent system, tools, `get_llm()` factory, human-in-the-loop | next |
-| 5 | Observability: OpenTelemetry, Prometheus, Grafana, Tempo, Loki, Langfuse | |
+| 5 | Observability: OpenTelemetry, Prometheus, Grafana, Tempo, Loki, Langfuse | ✅ done |
 | 6 | API, dashboard UI, case management, evaluation report (precision/recall/latency) | |
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 - **Neo4j never becomes healthy:** it must reach the internet to fetch plugins on first boot; check
   `docker compose logs neo4j`. Heap/pagecache are set low (1 GB / 512 MB) — raise in compose for bigger runs.
 - **`simulator` restarts:** it waits up to 60 s for Neo4j; check `docker compose logs simulator`.
+- **Grafana panels are empty:** check Status → Targets in Prometheus (:9090); a service that is down shows `DOWN`.
+  Dashboards need a minute of data; traces need `make up-obs` (tracing is off under plain `make up`).
+- **No traces in Tempo:** the collector holds a trace for 10 s before deciding; check
+  `docker compose logs otel-collector tempo`. Ordinary traces are sampled at 10%, alerts at 100%.
+- **No logs in Loki:** Alloy needs the Docker socket (`docker compose logs alloy`); on Docker Desktop for Windows/Mac
+  or rootless Docker adjust the socket path in `docker-compose.yml` and `observability/alloy/config.alloy`.
+- **An observability image will not pull:** versions are pinned in `docker-compose.yml`; bump the tag.
+- **Langfuse login fails:** headless init needs a fresh `langfuse_db` volume; `make reset`, or sign up in the UI and
+  create keys under Settings.
 - **Analytics falls back to networkx:** look for `GDS analysis failed` in `make analytics`; the GDS plugin may
   not have downloaded (`docker compose logs neo4j`). Results are equivalent, only slower on large graphs.
 - **No network flags / cluster alerts:** they need material flows (≥ `NET_MIN_AMOUNT`) within `NET_WINDOW_S`;
@@ -326,7 +408,7 @@ Then `docker compose up -d agent-service`. Agents never import a provider SDK di
 - **Auth failure after changing the password:** the old password is stored in the volume → `make reset`.
 - **Ollama is slow:** use a smaller model, or enable the GPU block in `docker-compose.yml`.
 
-## 15. Disclaimer
+## 16. Disclaimer
 
 Synthetic data only. Thresholds, typologies and scores are illustrative and unvalidated; real AML
 programmes need regulatory review, model governance, and real KYC/sanctions data sources.

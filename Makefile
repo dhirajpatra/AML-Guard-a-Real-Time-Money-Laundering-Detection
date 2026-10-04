@@ -1,6 +1,6 @@
 COMPOSE ?= docker compose
 .DEFAULT_GOAL := help
-.PHONY: help init up up-llm up-all down reset ps logs sim-stop sim-start peek truth decisions alerts net-alerts analytics analytics-once eval graph-shell test
+.PHONY: help init up up-llm up-obs up-all urls dashboards langfuse-smoke down reset ps logs sim-stop sim-start peek truth decisions alerts net-alerts analytics analytics-once eval graph-shell test
 
 help: ## Show targets
 	@awk 'BEGIN{FS=":.*## "} /^[a-z-]+:.*## /{printf "  %-12s %s\n",$$1,$$2}' $(MAKEFILE_LIST)
@@ -14,17 +14,34 @@ up: init ## Start core stack (Neo4j, Redpanda, Redis, Postgres, simulator)
 up-llm: init ## Core stack + Ollama (pulls the model on first run)
 	$(COMPOSE) --profile llm up -d --build
 
-up-all: init ## Everything incl. Redpanda Console
-	$(COMPOSE) --profile llm --profile tools up -d --build
+up-obs: init ## Core stack + observability (Grafana, Prometheus, Tempo, Loki, Langfuse) with tracing on
+	OTEL_ENABLED=true $(COMPOSE) --profile obs up -d --build
+
+up-all: init ## Everything: Ollama, Kafka UI and observability
+	OTEL_ENABLED=true $(COMPOSE) --profile llm --profile tools --profile obs up -d --build
+
+urls: ## Where everything lives
+	@echo "Grafana        http://localhost:3000   (admin / admin)"
+	@echo "Prometheus     http://localhost:9090"
+	@echo "Langfuse       http://localhost:3001   (admin@aml-guard.local / aml-guard-admin)"
+	@echo "Neo4j Browser  http://localhost:7474"
+	@echo "Kafka UI       http://localhost:8080   (make up-all)"
+	@echo "Alloy UI       http://localhost:12345"
+
+dashboards: ## Regenerate the Grafana dashboards from observability/grafana/build_dashboards.py
+	python observability/grafana/build_dashboards.py
+
+langfuse-smoke: ## Send a test trace to Langfuse
+	python scripts/langfuse_smoke.py
 
 down: ## Stop everything (keep data)
-	$(COMPOSE) --profile llm --profile tools down
+	$(COMPOSE) --profile llm --profile tools --profile obs --profile cadvisor down
 
 reset: ## Stop everything and DELETE all volumes
-	$(COMPOSE) --profile llm --profile tools down -v
+	$(COMPOSE) --profile llm --profile tools --profile obs --profile cadvisor down -v
 
 ps: ## Container status
-	$(COMPOSE) --profile llm --profile tools ps
+	$(COMPOSE) --profile llm --profile tools --profile obs --profile cadvisor ps
 
 logs: ## Tail logs (make logs s=simulator)
 	$(COMPOSE) logs -f --tail=100 $(s)
