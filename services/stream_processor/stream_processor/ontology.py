@@ -15,9 +15,9 @@ class Typology:
 
 DEFAULT_ONTOLOGY: dict[str, Typology] = {t.id: t for t in [
     Typology("STRUCTURING", "Structuring", 0.70, ("JUST_BELOW_THRESHOLD", "HIGH_VELOCITY")),
-    Typology("FAN_IN", "Smurfing / Fan-in", 0.75, ("MANY_TO_ONE", "SHARED_DEVICE", "HIGH_VELOCITY")),
-    Typology("ROUND_TRIP", "Round-tripping", 0.85, ("CYCLE", "LAYERED_HOPS")),
+    Typology("FAN_IN", "Smurfing / Fan-in", 0.75, ("MANY_TO_ONE", "SHARED_DEVICE", "HIGH_VELOCITY", "HUB_CENTRALITY")),
+    Typology("ROUND_TRIP", "Round-tripping", 0.85, ("CYCLE", "LAYERED_HOPS", "CIRCULAR_FLOW")),
     Typology("RAPID_PASS_THROUGH", "Rapid pass-through", 0.80, ("RAPID_PASS_THROUGH", "HIGH_RISK_JURISDICTION")),
     Typology("SHELL_LAYERING", "Shell-company layering", 0.90,
-             ("LAYERED_HOPS", "SHARED_ADDRESS", "HIGH_RISK_JURISDICTION")),
+             ("LAYERED_HOPS", "SHARED_ADDRESS", "HIGH_RISK_JURISDICTION", "SUSPICIOUS_CLUSTER")),
 ]}

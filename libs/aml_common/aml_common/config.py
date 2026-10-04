@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     topic_decisions: str = "transactions.decisions"
     topic_alerts: str = "alerts"
     topic_dlq: str = "transactions.dlq"
+    topic_network_alerts: str = "alerts.network"
 
     # Cache / case store
     redis_url: str = "redis://redis:6379/0"

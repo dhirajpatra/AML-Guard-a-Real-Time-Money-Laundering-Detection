@@ -90,3 +90,25 @@ def test_percentiles():
     assert percentile([1, 2, 3, 4, 5], 50) == 3
     s = summarize([float(i) for i in range(1, 101)])
     assert s["n"] == 100 and 49 <= s["p50"] <= 52 and s["max"] == 100.0
+
+
+def net(**k):
+    return {"ts": 0, "c": False, "t": False, "h": False, "cl": "CL-X", "cs": 5, "scc": 1, **k}
+
+
+def test_network_indicators_corroborate_but_do_not_stand_alone_when_weak():
+    big = txn(40000)
+    assert run(big, RedisFeatures(src_net=net(t=True)))[3] == "PASS"                    # tight cluster alone: 0.45
+    f, score, typ, v = run(big, RedisFeatures(dst_net=net(c=True)))
+    assert "CIRCULAR_FLOW" in f and typ == "ROUND_TRIP" and v == "REVIEW"               # early ring warning
+    assert run(big, RedisFeatures(src_net=net(h=True)))[3] == "PASS"                    # hub alone: weak
+    # corroborated: cluster + shared address -> review for shell layering
+    assert run(big, RedisFeatures(src_net=net(t=True)), dst=AccountProfile("organization", 2, 0))[3] == "REVIEW"
+
+
+def test_network_flags_ignored_for_immaterial_amounts_or_when_disabled():
+    rf = RedisFeatures(src_net=net(c=True, t=True))
+    assert run(txn(800), rf)[3] == "PASS"
+    cfg = RuleConfig(use_network=False)
+    fired, _ = derive_indicators(txn(40000), rf, GraphFeatures(), P, P, frozenset(), cfg)
+    assert "CIRCULAR_FLOW" not in fired

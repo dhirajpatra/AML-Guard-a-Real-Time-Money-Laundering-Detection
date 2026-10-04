@@ -80,7 +80,7 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        for t in transactions.raw transactions.truth transactions.decisions transactions.dlq alerts; do
+        for t in transactions.raw transactions.truth transactions.decisions transactions.dlq alerts alerts.network; do
           rpk -X brokers=redpanda:9092 topic create $$t -p 3 -r 1 || true
         done
 
@@ -199,6 +199,22 @@ services:
       redis:
         condition: service_healthy
       postgres:
+        condition: service_healthy
+
+  graph-analytics:
+    build:
+      context: .
+      dockerfile: services/graph_analytics/Dockerfile
+    container_name: aml-graph-analytics
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      neo4j-init:
+        condition: service_completed_successfully
+      redis:
         condition: service_healthy
 
 volumes:

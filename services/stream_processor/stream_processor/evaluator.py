@@ -51,17 +51,22 @@ def evaluate(decisions: list[dict], truth_rows: list[dict]) -> dict:
     div = lambda a, b: round(a / b, 4) if b else 0.0  # noqa: E731
 
     scen: dict[str, dict] = {}
-    for d, t in joined:
-        if t["is_laundering"]:
-            s = scen.setdefault(t["scenario_id"], {"typology": t["typology"], "n": 0, "hit": 0, "block": 0})
-            s["n"] += 1
-            s["hit"] += flagged(d)
-            s["block"] += d["verdict"] == "BLOCK"
+    for d, t in sorted((x for x in joined if x[1]["is_laundering"]), key=lambda x: x[0]["decided_at"]):
+        s = scen.setdefault(t["scenario_id"], {"typology": t["typology"], "n": 0, "hit": 0, "block": 0,
+                                               "first": None})
+        s["n"] += 1
+        if flagged(d):
+            s["hit"] += 1
+            if s["first"] is None:
+                s["first"] = s["n"]            # 1-based position of the first flagged txn in the scenario
+        s["block"] += d["verdict"] == "BLOCK"
     by_typ: dict[str, dict] = {}
     for s in scen.values():
-        b = by_typ.setdefault(s["typology"], {"scenarios": 0, "detected": 0, "txns": 0, "txns_flagged": 0})
+        b = by_typ.setdefault(s["typology"], {"scenarios": 0, "detected": 0, "early": 0, "txns": 0,
+                                              "txns_flagged": 0})
         b["scenarios"] += 1
         b["detected"] += s["hit"] > 0
+        b["early"] += s["first"] is not None and s["first"] < s["n"]   # flagged before the pattern completed
         b["txns"] += s["n"]
         b["txns_flagged"] += s["hit"]
 
@@ -70,7 +75,9 @@ def evaluate(decisions: list[dict], truth_rows: list[dict]) -> dict:
         "transactions": {"tp": tp, "fp": fp, "fn": fn, "tn": tn,
                          "precision": div(tp, tp + fp), "recall": div(tp, tp + fn), "fpr": div(fp, fp + tn)},
         "scenarios": {"total": len(scen), "detected": sum(1 for s in scen.values() if s["hit"] > 0),
-                      "detection_rate": div(sum(1 for s in scen.values() if s["hit"] > 0), len(scen))},
+                      "detection_rate": div(sum(1 for s in scen.values() if s["hit"] > 0), len(scen)),
+                      "early_rate": div(sum(1 for s in scen.values() if s["first"] and s["first"] < s["n"]),
+                                        len(scen))},
         "by_typology": by_typ,
         "latency_ms": {"processing": summarize([d["processing_ms"] for d, _ in joined]),
                        "end_to_end": summarize([d["e2e_ms"] for d, _ in joined])},
@@ -96,9 +103,10 @@ def main() -> None:
           f"   (TP {t['tp']} FP {t['fp']} FN {t['fn']} TN {t['tn']})")
     print(f"  Scenarios : {sc['detected']}/{sc['total']} detected ({sc['detection_rate']:.1%})  "
           f"- a scenario counts as detected if any of its txns is flagged")
-    print("\n  Typology               scenarios  detected  txns flagged")
+    print(f"  Early     : {sc['early_rate']:.1%} of scenarios flagged BEFORE their final transaction")
+    print("\n  Typology               scenarios  detected  early  txns flagged")
     for k, b in sorted(r["by_typology"].items()):
-        print(f"  {k:<22} {b['scenarios']:>9} {b['detected']:>9} {b['txns_flagged']:>7}/{b['txns']}")
+        print(f"  {k:<22} {b['scenarios']:>9} {b['detected']:>9} {b['early']:>6} {b['txns_flagged']:>7}/{b['txns']}")
     for name, v in lat.items():
         print(f"\n  Latency {name:<11} p50 {v['p50']:>8.1f} ms  p95 {v['p95']:>8.1f} ms  "
               f"p99 {v['p99']:>8.1f} ms  max {v['max']:>8.1f} ms  (n={v['n']})")

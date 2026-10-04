@@ -12,3 +12,5 @@ class ProcSettings(Settings):
     flow_min_amount: float = 5000.0      # graph flow queries only run for material amounts
     profile_ttl_s: float = 300.0
     stats_interval_s: float = 10.0
+    net_features_enabled: bool = True    # use cold-path network flags from Redis
+    net_max_age_s: float = 240.0

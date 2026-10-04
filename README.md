@@ -4,7 +4,7 @@ A containerised, observable, multi-agent system that scores every transaction in
 **Neo4j knowledge graph** and an **AML ontology**, and escalates suspicious activity to a **LangGraph**
 team of agents that investigates and explains it. The LLM is **pluggable** (Ollama by default).
 
-> **Status:** Phase 2 of 6 complete (hot-path stream processor with live verdicts, plus an evaluation benchmark).
+> **Status:** Phase 3 of 6 complete (hot path + cold-path graph analytics feeding network risk back into it).
 > See [Roadmap](#roadmap). This is a reference implementation on **synthetic data** — not a
 > production-certified AML system.
 
@@ -77,7 +77,7 @@ aml-guard/
 ├── services/
 │   ├── simulator/              # Phase 1: synthetic transactions + laundering scenarios
 │   │   └── simulator/{population,scenarios,graph_seed,main,settings}.py
-│   └── stream_processor/       # Phase 2: the real-time hot path
+│   ├── stream_processor/       # Phase 2: the real-time hot path
 │       └── stream_processor/
 │           ├── main.py         # Kafka loop: raw -> decisions / alerts / DLQ, Postgres batches
 │           ├── pipeline.py     # one transaction: Redis -> graph -> score
@@ -86,8 +86,15 @@ aml-guard/
 │           ├── rules.py        # indicators -> typology scores -> verdict (pure, unit-tested)
 │           ├── ontology.py     # typology fallback (checked against graph/01_schema.cypher)
 │           ├── persistence.py  # idempotent Postgres writer
-│           └── evaluator.py    # precision / recall / latency report
-├── tests/{simulator,stream_processor}/   # unit tests + end-to-end "digital twin" test
+│           └── evaluator.py    # precision / recall / early-detection / latency report
+│   └── graph_analytics/        # Phase 3: the cold path (scheduled)
+│       └── graph_analytics/
+│           ├── main.py         # cycle: fetch -> analyse -> score -> Redis/Neo4j/Kafka -> prune
+│           ├── engines.py      # GdsEngine (in Neo4j) and NetworkxEngine (fallback / reference)
+│           ├── netscore.py     # pure: clusters + SCC + PageRank -> per-account flags, cluster alerts
+│           ├── store.py        # Redis flags, Neo4j properties + :Cluster nodes, alert dedupe, pruning
+│           └── settings.py
+├── tests/{simulator,stream_processor,graph_analytics}/   # unit tests + "digital twin" end-to-end tests
 ├── requirements-dev.txt
 └── docs/
 ```
@@ -104,7 +111,7 @@ Planned: `services/agent_service/` (P4), `services/api/` & `ui/` (P6),
 ## 6. Installation & quick start
 
 ```bash
-git clone https://github.com/dhirajpatra/AML-Guard-a-Real-Time-Money-Laundering-Detection aml-guard && cd aml-guard
+git clone <your-repo> aml-guard && cd aml-guard
 make init                 # creates .env from .env.example (edit passwords if you like)
 make up                   # core: Neo4j, Redpanda, Redis, Postgres, simulator
 make ps                   # wait until everything is healthy / init jobs exited 0
@@ -134,13 +141,19 @@ Without `make`: `cp .env.example .env && docker compose up -d --build`
    RETURN a.address_id, n ORDER BY n DESC;                                    // shared-address clusters
    MATCH (j:Jurisdiction {high_risk:true}) RETURN j.code;                     // high-risk list
    ```
-5. **Hot path (Phase 2):** `make logs s=stream-processor` shows `stats` lines (tps, latency percentiles, review/block counts);
+5. **Cold path (Phase 3):** `make analytics-once` (one cycle, prints the summary), then in Neo4j:
+   ```cypher
+   MATCH (a:Account)-[:MEMBER_OF]->(k:Cluster) RETURN k.cluster_id, k.size, k.internal_ratio, collect(a.account_id) LIMIT 5;
+   MATCH (a:Account) WHERE a.net_circular RETURN a.account_id, a.net_cluster, a.net_scc_size LIMIT 10;
+   ```
+   Redis: `docker compose exec redis redis-cli GET net:ACC-000123` (a flagged account); `make net-alerts` for cluster alerts.
+6. **Hot path (Phase 2):** `make logs s=stream-processor` shows `stats` lines (tps, latency percentiles, review/block counts);
    `make decisions` / `make alerts` show verdicts; in Neo4j:
    ```cypher
    MATCH (a:Account)-[f:TRANSFERRED_TO]->(b) RETURN a.account_id, b.account_id, f.count, f.last_amount LIMIT 10;
    ```
    Postgres: `docker compose exec postgres psql -U aml -c "select verdict, count(*) from decisions group by 1"`
-6. **Unit tests (host):** `pip install -r requirements-dev.txt && make test`
+7. **Unit tests (host):** `pip install -r requirements-dev.txt && make test`
 
 ## 8. Phase 2: how the hot path decides
 
@@ -168,7 +181,8 @@ Offsets are committed only after decisions are flushed → at-least-once, safe o
 **Known limits (deliberate for now):** a pattern is flagged on the transaction that *completes* it (the first
 hops of a ring look innocent); typology labels on intermediate hops can be ambiguous (agents resolve this in
 Phase 4); one processor instance handles tens to low hundreds of tps — scale by running more replicas
-(topics have 3 partitions); `TRANSFERRED_TO` edges are not pruned yet (Phase 3 adds time-bucketing).
+(topics have 3 partitions); `Transaction` nodes are kept forever (only flow edges are pruned) — add a
+retention job before running long.
 
 ### Benchmark recipe (detection quality + latency)
 
@@ -182,7 +196,53 @@ make eval                                                    # joins decisions w
 `processing_ms` is time inside the hot path; `e2e_ms` additionally includes queueing.
 After upgrading from Phase 1 run `make reset` (the simulator population changed, so the old graph is stale).
 
-## 9. Configuration (`.env`)
+## 9. Phase 3: the cold path (graph analytics)
+
+Every `NET_INTERVAL_S` the `graph-analytics` service looks at the **material recent flow graph**
+(`TRANSFERRED_TO` edges newer than `NET_WINDOW_S` carrying ≥ `NET_MIN_AMOUNT`) and:
+
+1. **Clusters** = weakly connected components (Louvain only splits components > `NET_MAX_CLUSTER`;
+   on small sparse structures modularity optimisation fragments exactly the patterns we want to keep whole).
+2. **Loops** = strongly connected components (money that comes back, of any length).
+3. **Centrality** = weighted PageRank (hub detection inside a cluster).
+4. `netscore` (pure, unit-tested) turns these into per-account flags: `circular` (SCC ≥ 3), `tight`
+   (cluster ≥ 4 and ≥ 80% internal flow), `hub` (≥ 2× cluster-mean PageRank with ≥ 3 senders).
+
+Outputs:
+- **Redis** `net:<account>` (flagged accounts only, with TTL; stale ones removed) → the hot path reads them in
+  the *same pipelined round trip* as its other features and fires `CIRCULAR_FLOW` (0.70), `SUSPICIOUS_CLUSTER`
+  (0.50), `HUB_CENTRALITY` (0.40) for material amounts. These sit in the ontology (`ROUND_TRIP`,
+  `SHELL_LAYERING`, `FAN_IN`), so they corroborate other evidence but never alert alone.
+  Flags older than `NET_MAX_AGE_S` in event time are ignored, so an analytics outage degrades gracefully.
+- **Neo4j**: `Account.net_*` properties, plus `(:Cluster)` nodes with `(Account)-[:MEMBER_OF]->(Cluster)` —
+  context the Phase 4 investigator agent will query.
+- **Kafka** `alerts.network`: one alert per distinct closed loop / tight cluster (deduplicated in Redis).
+  These catch what the hot path structurally cannot: rings whose hops are spread over more than its 5-minute
+  flow window, or loops longer than its 3-hop search.
+- **Retention**: edges older than `EDGE_RETENTION_S` are pruned in batches (`Transaction` nodes keep the history).
+
+"Now" for all windows is *graph time* (newest flow edge), not wall-clock, so backlog replays stay consistent.
+`NET_ENGINE=auto` runs the algorithms in Neo4j GDS and falls back to networkx (with a log warning) if the
+GDS calls fail; both engines return the same structure. `make analytics-once` prints a one-cycle summary
+(engine used, edges, flagged accounts, alerts, per-stage milliseconds).
+
+**What the network layer buys (measured on the synthetic twin, 92 scenarios, 9,012 normal txns):**
+scenario detection stayed 92/92 with or without it; scenarios flagged *before their final transaction* went
+from 74 to 77 (all in rapid pass-through chains) at the cost of 3 extra false positives (7 → 10, 0.078% →
+0.111%). That is a small effect, because the hot path already detects everything in dense synthetic traffic.
+Its distinctive value is the slow-ring case: a 4-account ring with hops 8 minutes apart is missed entirely by
+the hot path and surfaces as a `closed_loop` cluster alert within one analytics interval of closing
+(`tests/graph_analytics/test_slow_ring.py`). Expect the live numbers to differ; measure with the A/B recipe.
+
+### A/B recipe (does the network layer help on your run?)
+
+```bash
+make reset && NET_FEATURES_ENABLED=false SIM_MAX_TXNS=8000 make up && sleep 150 && make eval   # baseline
+make reset && NET_FEATURES_ENABLED=true  SIM_MAX_TXNS=8000 make up && sleep 150 && make eval   # with network flags
+```
+Compare detection, the `Early` line, and FPR. (`.env` values are overridden by the shell variables above.)
+
+## 10. Configuration (`.env`)
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -202,10 +262,17 @@ After upgrading from Phase 1 run `make reset` (the simulator population changed,
 | `FLOW_WINDOW_S` | `300` | How far back flow tracing looks (seconds) |
 | `FLOW_MIN_AMOUNT` | `5000` | Graph flow queries run only for material amounts (keeps latency low) |
 | `PROC_OFFSET_RESET` | `earliest` | Where a new processor group starts reading `transactions.raw` |
+| `NET_ENGINE` | `auto` | `gds` \| `networkx` \| `auto` (try Neo4j GDS, fall back to networkx with a warning) |
+| `NET_INTERVAL_S` / `NET_WINDOW_S` | `60` / `1800` | Analytics cadence and recent-flow horizon (graph/event time) |
+| `NET_MIN_AMOUNT` | `5000` | Only material flows enter the analytics graph |
+| `NET_MAX_CLUSTER` | `40` | Components larger than this are split with Louvain |
+| `EDGE_RETENTION_S` | `3600` | `TRANSFERRED_TO` edges older than this are pruned |
+| `NET_FEATURES_ENABLED` | `true` | Hot path consumes the cold-path flags (turn off for A/B runs) |
+| `NET_MAX_AGE_S` | `240` | Hot path ignores flags older than this (event time) |
 
 Run a finite, reproducible burst: `SIM_MAX_TXNS=5000 SIM_SEED=7 docker compose up -d --build simulator`.
 
-## 10. Everyday commands
+## 11. Everyday commands
 
 | Command | Does |
 |---|---|
@@ -215,10 +282,12 @@ Run a finite, reproducible burst: `SIM_MAX_TXNS=5000 SIM_SEED=7 docker compose u
 | `make logs s=<service>` | Tail logs |
 | `make sim-stop` / `make sim-start` | Pause / resume traffic |
 | `make decisions` / `make alerts` | Peek at hot-path verdicts / alerts |
-| `make eval` | Precision, recall and latency report vs ground truth |
+| `make analytics` / `make analytics-once` | Tail cold-path logs / run one cycle now and print its summary |
+| `make net-alerts` | Peek at cluster-level alerts (`alerts.network`) |
+| `make eval` | Precision, recall, early detection and latency report vs ground truth |
 | `make graph-shell` | cypher-shell into Neo4j |
 
-## 11. Switching the LLM (Phase 4 design, config already in place)
+## 12. Switching the LLM (Phase 4 design, config already in place)
 
 ```bash
 # Local (default)
@@ -230,22 +299,26 @@ LLM_PROVIDER=openai_compatible  LLM_BASE_URL=http://host:8000/v1  LLM_MODEL=...
 ```
 Then `docker compose up -d agent-service`. Agents never import a provider SDK directly.
 
-## 12. Roadmap
+## 13. Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Compose skeleton, graph schema + ontology, simulator, tests | ✅ done |
 | 2 | Hot path: stream processor, rules, Redis features, graph write + flow tracing, evaluator | ✅ done |
-| 3 | GDS batch jobs (communities, cycles, centrality) feeding hot-path features | next |
-| 4 | LangGraph multi-agent system, tools, `get_llm()` factory, human-in-the-loop | |
+| 3 | Cold path: GDS/networkx analytics (clusters, SCC loops, PageRank), network flags → hot path, cluster alerts, edge pruning | ✅ done |
+| 4 | LangGraph multi-agent system, tools, `get_llm()` factory, human-in-the-loop | next |
 | 5 | Observability: OpenTelemetry, Prometheus, Grafana, Tempo, Loki, Langfuse | |
 | 6 | API, dashboard UI, case management, evaluation report (precision/recall/latency) | |
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 - **Neo4j never becomes healthy:** it must reach the internet to fetch plugins on first boot; check
   `docker compose logs neo4j`. Heap/pagecache are set low (1 GB / 512 MB) — raise in compose for bigger runs.
 - **`simulator` restarts:** it waits up to 60 s for Neo4j; check `docker compose logs simulator`.
+- **Analytics falls back to networkx:** look for `GDS analysis failed` in `make analytics`; the GDS plugin may
+  not have downloaded (`docker compose logs neo4j`). Results are equivalent, only slower on large graphs.
+- **No network flags / cluster alerts:** they need material flows (≥ `NET_MIN_AMOUNT`) within `NET_WINDOW_S`;
+  run `make analytics-once` and read `edges` / `flagged_accounts` in the summary.
 - **No decisions appear:** check `make logs s=stream-processor`; it waits for Neo4j, Redis and Postgres.
   Verdicts only flow once `transactions.raw` has data (`make peek`).
 - **Everything is `PASS`:** flow tracing needs amounts ≥ `FLOW_MIN_AMOUNT` and a stack that ran after `make reset`.
@@ -253,7 +326,7 @@ Then `docker compose up -d agent-service`. Agents never import a provider SDK di
 - **Auth failure after changing the password:** the old password is stored in the volume → `make reset`.
 - **Ollama is slow:** use a smaller model, or enable the GPU block in `docker-compose.yml`.
 
-## 14. Disclaimer
+## 15. Disclaimer
 
 Synthetic data only. Thresholds, typologies and scores are illustrative and unvalidated; real AML
 programmes need regulatory review, model governance, and real KYC/sanctions data sources.

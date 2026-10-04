@@ -49,3 +49,17 @@ def test_recent_inbound_for_pass_through():
     assert rf.recent_inbound_to_src == [30000.0]
     late = fs.update_and_read(mk(3, "MID", "Z", 29000.0, 60))
     assert late.recent_inbound_to_src == []
+
+
+def test_network_flags_read_and_staleness():
+    import json
+    r = fakeredis.FakeRedis(decode_responses=True)
+    fs = FeatureStore(r, net_max_age_s=240.0)
+    ts0 = T0.timestamp()
+    r.set("net:A", json.dumps({"ts": ts0 - 60, "c": True, "t": True, "h": False, "cl": "CL-A", "cs": 4, "scc": 4}))
+    r.set("net:B", json.dumps({"ts": ts0 - 1000, "c": True, "t": False, "h": False, "cl": "CL-B", "cs": 3, "scc": 3}))
+    rf = fs.update_and_read(mk(1, "A", "B", 9000.0, 0))
+    assert rf.src_net and rf.src_net["cl"] == "CL-A"
+    assert rf.dst_net is None                       # analytics older than net_max_age_s -> ignored
+    off = FeatureStore(r, read_net=False).update_and_read(mk(2, "A", "B", 9000.0, 1))
+    assert off.src_net is None and off.dst_net is None

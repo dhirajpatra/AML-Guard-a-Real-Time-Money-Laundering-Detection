@@ -12,9 +12,12 @@ CREATE CONSTRAINT jurisdiction    IF NOT EXISTS FOR (n:Jurisdiction)  REQUIRE n.
 CREATE CONSTRAINT typology_id     IF NOT EXISTS FOR (n:Typology)      REQUIRE n.id            IS UNIQUE;
 CREATE CONSTRAINT indicator_id    IF NOT EXISTS FOR (n:RiskIndicator) REQUIRE n.id            IS UNIQUE;
 CREATE CONSTRAINT ontology_class  IF NOT EXISTS FOR (n:OntologyClass) REQUIRE n.name          IS UNIQUE;
+CREATE CONSTRAINT cluster_id      IF NOT EXISTS FOR (n:Cluster)       REQUIRE n.cluster_id    IS UNIQUE;
 
 // ---- Indexes for hot-path lookups ----
 CREATE INDEX txn_ts IF NOT EXISTS FOR (t:Transaction) ON (t.ts);
+// Time-window scans and retention pruning of the aggregated flow edges (Phase 3)
+CREATE INDEX transferred_last_ts IF NOT EXISTS FOR ()-[f:TRANSFERRED_TO]-() ON (f.last_ts);
 
 // ---- Ontology: class hierarchy (what kinds of things exist) ----
 // ShellCompany is an INFERRED class: it is never asserted in the data; agents derive it
@@ -28,7 +31,8 @@ UNWIND [
   {name:'Transaction',  parent:null},
   {name:'Device',       parent:null},
   {name:'Address',      parent:null},
-  {name:'Jurisdiction', parent:null}
+  {name:'Jurisdiction', parent:null},
+  {name:'Cluster',      parent:null}
 ] AS c
 MERGE (k:OntologyClass {name:c.name})
 WITH k, c WHERE c.parent IS NOT NULL
@@ -42,16 +46,16 @@ UNWIND [
    weight:0.70, indicators:['JUST_BELOW_THRESHOLD','HIGH_VELOCITY']},
   {id:'FAN_IN', name:'Smurfing / Fan-in',
    description:'Many unrelated accounts funnel small amounts into one collector account.',
-   weight:0.75, indicators:['MANY_TO_ONE','SHARED_DEVICE','HIGH_VELOCITY']},
+   weight:0.75, indicators:['MANY_TO_ONE','SHARED_DEVICE','HIGH_VELOCITY','HUB_CENTRALITY']},
   {id:'ROUND_TRIP', name:'Round-tripping',
    description:'Funds travel through a ring of accounts and return to the origin.',
-   weight:0.85, indicators:['CYCLE','LAYERED_HOPS']},
+   weight:0.85, indicators:['CYCLE','LAYERED_HOPS','CIRCULAR_FLOW']},
   {id:'RAPID_PASS_THROUGH', name:'Rapid pass-through',
    description:'Funds received and forwarded within seconds, minus a small fee.',
    weight:0.80, indicators:['RAPID_PASS_THROUGH','HIGH_RISK_JURISDICTION']},
   {id:'SHELL_LAYERING', name:'Shell-company layering',
    description:'Multi-hop chain of shell entities ending in a high-risk jurisdiction.',
-   weight:0.90, indicators:['LAYERED_HOPS','SHARED_ADDRESS','HIGH_RISK_JURISDICTION']}
+   weight:0.90, indicators:['LAYERED_HOPS','SHARED_ADDRESS','HIGH_RISK_JURISDICTION','SUSPICIOUS_CLUSTER']}
 ] AS t
 MERGE (ty:Typology {id:t.id})
   SET ty.name = t.name, ty.description = t.description, ty.base_weight = t.weight

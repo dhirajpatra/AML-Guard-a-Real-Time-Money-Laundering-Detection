@@ -20,6 +20,10 @@ STRENGTH: dict[str, float] = {
     "CYCLE": 1.00,
     "LAYERED_HOPS": 0.80,
     "RAPID_PASS_THROUGH": 0.90,
+    # cold-path (graph analytics) indicators
+    "CIRCULAR_FLOW": 0.70,
+    "SUSPICIOUS_CLUSTER": 0.50,
+    "HUB_CENTRALITY": 0.40,
 }
 
 
@@ -33,6 +37,8 @@ class RuleConfig:
     passthrough_min_amount: float = 5000.0
     layered_min_up: int = 2
     flow_min_amount: float = 5000.0
+    use_network: bool = True
+    net_min_amount: float = 5000.0     # network context only matters for material flows
     review_threshold: float = 0.50
     block_threshold: float = 0.80
 
@@ -80,6 +86,17 @@ def derive_indicators(txn: Transaction, rf: RedisFeatures, gf: GraphFeatures,
             a > 0 and cfg.passthrough_ratio_lo <= txn.amount / a <= 1.0 for a in rf.recent_inbound_to_src):
         fired["RAPID_PASS_THROUGH"] = STRENGTH["RAPID_PASS_THROUGH"]
         ev["forwarded_from_recent_inbound"] = True
+    if cfg.use_network and txn.amount >= cfg.net_min_amount:
+        nets = [n for n in (rf.src_net, rf.dst_net) if n]
+        if any(n.get("c") for n in nets):
+            fired["CIRCULAR_FLOW"] = STRENGTH["CIRCULAR_FLOW"]
+            ev["circular_flow_cluster"] = sorted({n["cl"] for n in nets if n.get("c")})
+        if any(n.get("t") for n in nets):
+            fired["SUSPICIOUS_CLUSTER"] = STRENGTH["SUSPICIOUS_CLUSTER"]
+            ev["suspicious_cluster"] = sorted({n["cl"] for n in nets if n.get("t")})
+        if any(n.get("h") for n in nets):
+            fired["HUB_CENTRALITY"] = STRENGTH["HUB_CENTRALITY"]
+            ev["hub_cluster"] = sorted({n["cl"] for n in nets if n.get("h")})
     return fired, ev
 
 

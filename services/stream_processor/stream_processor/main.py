@@ -45,8 +45,10 @@ def run() -> None:
     pg.ensure_schema()
 
     cfg = RuleConfig(review_threshold=s.review_threshold, block_threshold=s.block_threshold,
-                     flow_min_amount=s.flow_min_amount)
-    pipeline = Pipeline(FeatureStore(rds), graph, ontology, cfg, flow_window_s=s.flow_window_s)
+                     flow_min_amount=s.flow_min_amount, use_network=s.net_features_enabled,
+                     net_min_amount=s.flow_min_amount)
+    features = FeatureStore(rds, read_net=s.net_features_enabled, net_max_age_s=s.net_max_age_s)
+    pipeline = Pipeline(features, graph, ontology, cfg, flow_window_s=s.flow_window_s)
 
     consumer = Consumer({
         "bootstrap.servers": s.kafka_bootstrap, "group.id": s.proc_group,

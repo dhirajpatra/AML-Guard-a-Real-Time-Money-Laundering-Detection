@@ -48,6 +48,10 @@ class InMemoryGraph:
         c = self.pop.customer_of(account_id)
         return AccountProfile(c.kind, self.addr[c.address_id] - 1, self.dev[c.device_id] - 1)
 
+    def material_edges(self, since: float, min_amount: float) -> list[tuple[str, str, float]]:
+        return [(a, b, e["last_amount"]) for (a, b), e in self.edges.items()
+                if e["last_ts"] >= since and e["last_amount"] >= min_amount]
+
     def _forward(self, node: str, depth: int, used: set, path: list, since: float):
         if path:
             yield list(path), node
@@ -132,3 +136,34 @@ def simulate(seed: int, duration_s: float = 600, tps: float = 10, scen_per_min: 
         events.append(txn)
         truth[txn.txn_id] = (sc.typology, sc.scenario_id) if sc else (None, None)
     return pop, events, truth
+
+
+def run_with_analytics(pop, events, redis_client, use_net=True, interval_s=60.0, window_s=1800.0,
+                       min_amount=5000.0, ontology=None, cfg=None, ttl_s=240, min_cluster=3):
+    """Replay events through the hot path; every `interval_s` of virtual time run the cold path
+    (NetworkxEngine + netscore + the real Redis writer) exactly as graph_analytics.main does."""
+    from graph_analytics.engines import NetworkxEngine
+    from graph_analytics.netscore import NetConfig, build_features, cluster_alerts
+    from graph_analytics.store import write_redis
+    from stream_processor.features import FeatureStore
+    from stream_processor.ontology import DEFAULT_ONTOLOGY
+    from stream_processor.pipeline import Pipeline
+    from stream_processor.rules import RuleConfig
+
+    graph = InMemoryGraph(pop, ["IR", "KP", "MM"])
+    cfg = cfg or RuleConfig(use_network=use_net)
+    pipe = Pipeline(FeatureStore(redis_client, read_net=use_net), graph, ontology or DEFAULT_ONTOLOGY, cfg)
+    engine, decisions, runs, alerts, seen = NetworkxEngine(), {}, [], [], set()
+    next_run = T0.timestamp() + interval_s
+    for t in events:
+        ts = t.ts.timestamp()
+        while use_net and ts >= next_run:
+            edges = graph.material_edges(next_run - window_s, min_amount)
+            feats, clusters = build_features(edges, engine.analyze(edges), NetConfig())
+            for a in cluster_alerts(feats, clusters, next_run, min_cluster):
+                if a["signature"] not in seen:
+                    seen.add(a["signature"]); alerts.append(a)
+            runs.append((len(edges), write_redis(redis_client, feats, next_run, ttl_s)))
+            next_run += interval_s
+        decisions[t.txn_id] = pipe.process(t, now=t.ts)
+    return decisions, runs, alerts
